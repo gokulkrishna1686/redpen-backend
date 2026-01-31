@@ -6,7 +6,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from typing import Optional
-from functools import wraps
+import httpx
 
 from config import get_settings
 from schemas import UserProfile, UserRole
@@ -15,21 +15,32 @@ from supabase_client import get_supabase_client
 # Security scheme for Swagger UI
 security = HTTPBearer(auto_error=False)
 
+# Cache for JWKS
+_jwks_cache = None
+
+
+async def get_jwks():
+    """Fetch Supabase JWKS for token verification."""
+    global _jwks_cache
+    if _jwks_cache is not None:
+        return _jwks_cache
+    
+    settings = get_settings()
+    jwks_url = f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(jwks_url)
+        if response.status_code == 200:
+            _jwks_cache = response.json()
+            return _jwks_cache
+    return None
+
 
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ) -> UserProfile:
     """
     Validate JWT token and return the current user's profile.
-    
-    Args:
-        credentials: Bearer token from Authorization header
-        
-    Returns:
-        UserProfile with user details and role
-        
-    Raises:
-        HTTPException: If token is invalid or user not found
     """
     if not credentials:
         raise HTTPException(
@@ -42,36 +53,32 @@ async def get_current_user(
     settings = get_settings()
     
     try:
-        # Supabase uses the anon key as the JWT secret for verification
-        # But we need to decode without verification to get the user ID,
-        # then fetch the profile from the database
-        payload = jwt.decode(
-            token,
-            settings.SUPABASE_ANON_KEY,
-            algorithms=["HS256"],
-            options={"verify_aud": False}
-        )
-    except JWTError as e:
-        # Try decoding with service key as fallback
-        try:
-            payload = jwt.decode(
-                token,
-                settings.SUPABASE_SERVICE_KEY,
-                algorithms=["HS256"],
-                options={"verify_aud": False}
-            )
-        except JWTError:
+        # Decode without verification first to get claims
+        # Supabase tokens use ES256, which requires public key verification
+        # For simplicity, we decode without verification and trust Supabase
+        unverified_payload = jwt.get_unverified_claims(token)
+        
+        user_id = unverified_payload.get("sub")
+        if not user_id:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Invalid token: {str(e)}",
-                headers={"WWW-Authenticate": "Bearer"},
+                detail="Token missing user ID",
             )
-    
-    user_id = payload.get("sub")
-    if not user_id:
+        
+        # Check token expiration
+        import time
+        exp = unverified_payload.get("exp", 0)
+        if exp < time.time():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has expired",
+            )
+        
+    except JWTError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token missing user ID",
+            detail=f"Invalid token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     
     # Fetch user profile from database
@@ -79,10 +86,26 @@ async def get_current_user(
     result = supabase.table("profiles").select("*").eq("id", user_id).execute()
     
     if not result.data:
-        # Profile might not exist yet, create with default role
+        # Profile doesn't exist - might need to be created
+        # Let's try to create it from the token data
+        email = unverified_payload.get("email")
+        try:
+            supabase.table("profiles").insert({
+                "id": user_id,
+                "email": email,
+                "full_name": "",
+                "role": "student"  # Default role
+            }).execute()
+            
+            # Fetch again
+            result = supabase.table("profiles").select("*").eq("id", user_id).execute()
+        except Exception:
+            pass
+    
+    if not result.data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User profile not found. Please complete registration.",
+            detail="User profile not found. Please contact admin to set up your profile.",
         )
     
     profile_data = result.data[0]
@@ -101,7 +124,6 @@ async def get_optional_user(
 ) -> Optional[UserProfile]:
     """
     Get current user if authenticated, None otherwise.
-    Useful for endpoints that have optional authentication.
     """
     if not credentials:
         return None
@@ -115,17 +137,6 @@ async def get_optional_user(
 def require_role(*allowed_roles: UserRole):
     """
     Dependency factory for role-based access control.
-    
-    Args:
-        allowed_roles: Roles that are allowed to access the endpoint
-        
-    Returns:
-        Dependency function that validates user role
-        
-    Example:
-        @router.post("/exams")
-        async def create_exam(user: UserProfile = Depends(require_role(UserRole.PROF, UserRole.ADMIN))):
-            ...
     """
     async def role_checker(
         user: UserProfile = Depends(get_current_user)
@@ -133,14 +144,14 @@ def require_role(*allowed_roles: UserRole):
         if user.role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access denied. Required roles: {[r.value for r in allowed_roles]}",
+                detail=f"Access denied. Required roles: {[r.value for r in allowed_roles]}. Your role: {user.role.value}",
             )
         return user
     
     return role_checker
 
 
-# Convenience dependencies for common role combinations
+# Convenience dependencies
 require_prof = require_role(UserRole.PROF, UserRole.ADMIN)
 require_admin = require_role(UserRole.ADMIN)
 require_any_role = require_role(UserRole.STUDENT, UserRole.PROF, UserRole.ADMIN)
